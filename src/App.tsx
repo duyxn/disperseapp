@@ -10,6 +10,7 @@ import { parseEther, parseUnits, formatUnits, isAddress } from 'viem';
 import { DISPERSE_ADDRESS, disperseAbi, erc20Abi } from './abi';
 
 const USDC_ADDRESS = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48' as const;
+const USDT_ADDRESS = '0xdac17f958d2ee523a2206206994597c13d831ec7' as const;
 
 type ParsedEntry = {
   address: `0x${string}`;
@@ -55,12 +56,12 @@ function parseRecipients(input: string): ParseResult {
 
 function App() {
   const { address: userAddress, isConnected } = useAccount();
-  const [mode, setMode] = useState<'eth' | 'usdc' | 'erc20'>('eth');
+  const [mode, setMode] = useState<'eth' | 'usdc' | 'usdt' | 'erc20'>('eth');
   const [customTokenAddress, setCustomTokenAddress] = useState('');
   const [recipientInput, setRecipientInput] = useState('');
 
   const isToken = mode !== 'eth';
-  const tokenAddress = mode === 'usdc' ? USDC_ADDRESS : customTokenAddress;
+  const tokenAddress = mode === 'usdc' ? USDC_ADDRESS : mode === 'usdt' ? USDT_ADDRESS : customTokenAddress;
 
   const validTokenAddress = isAddress(tokenAddress) ? (tokenAddress as `0x${string}`) : undefined;
 
@@ -212,7 +213,7 @@ function App() {
         {/* Token Selector */}
         <div className="mb-4 rounded-lg bg-gray-900 p-6">
           <div className="mb-4 flex gap-4">
-            {(['eth', 'usdc', 'erc20'] as const).map((m) => (
+            {(['eth', 'usdc', 'usdt', 'erc20'] as const).map((m) => (
               <button
                 key={m}
                 onClick={() => {
@@ -223,7 +224,7 @@ function App() {
                   mode === m ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:text-white'
                 }`}
               >
-                {m === 'eth' ? 'ETH' : m === 'usdc' ? 'USDC' : 'ERC-20'}
+                {m === 'eth' ? 'ETH' : m === 'usdc' ? 'USDC' : m === 'usdt' ? 'USDT' : 'ERC-20'}
               </button>
             ))}
           </div>
