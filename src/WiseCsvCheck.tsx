@@ -89,6 +89,12 @@ export function WiseCsvCheck() {
   }
 
   const cleanCount = parsed ? parsed.rows.length - removableLines.size : 0;
+
+  // Anything that stopped us seeing the full payout history. A "no duplicates"
+  // result means nothing if part of the history never made it into the compare.
+  const incomplete = Boolean(
+    history && (history.truncated || history.lookupsFailed || history.unresolved),
+  );
   const acknowledgedCount = (result?.flags ?? []).length - flags.length;
 
   return (
@@ -151,6 +157,18 @@ export function WiseCsvCheck() {
             not compared.
           </p>
         )}
+
+        {history && (history.lookupsFailed || history.unresolved) ? (
+          <p className="mt-3 text-sm text-amber-500/80">
+            {history.lookupsFailed
+              ? `${history.lookupsFailed} recipient lookup${history.lookupsFailed === 1 ? '' : 's'} failed. `
+              : ''}
+            {history.unresolved
+              ? `${history.unresolved} transfer${history.unresolved === 1 ? '' : 's'} had no usable email. `
+              : ''}
+            Those payouts could not be compared, so this check is incomplete.
+          </p>
+        ) : null}
       </div>
 
       {parsed && parsed.problems.length > 0 && (
@@ -172,10 +190,13 @@ export function WiseCsvCheck() {
       {result && (
         <div className="mb-4 rounded-lg bg-gray-900 p-6">
           {flags.length === 0 ? (
-            <p className="text-sm text-green-400">
+            // Only claim a clean result when the comparison was actually complete.
+            <p className={`text-sm ${incomplete ? 'text-amber-400' : 'text-green-400'}`}>
               {acknowledgedCount > 0
                 ? `All ${acknowledgedCount} flagged recipient${acknowledgedCount === 1 ? '' : 's'} acknowledged — nothing left to review.`
-                : `No recipient in this batch was paid in the last ${days} day${days === 1 ? '' : 's'}. Checked against ${history?.count ?? 0} Wise transfer${history?.count === 1 ? '' : 's'}.`}
+                : incomplete
+                  ? `No match found among the ${history?.count ?? 0} Wise transfer${history?.count === 1 ? '' : 's'} compared — but the history above was incomplete, so treat this as unconfirmed.`
+                  : `No recipient in this batch was paid in the last ${days} day${days === 1 ? '' : 's'}. Checked against ${history?.count ?? 0} Wise transfer${history?.count === 1 ? '' : 's'}.`}
             </p>
           ) : (
             <>

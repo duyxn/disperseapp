@@ -33,8 +33,18 @@ const configuredUrl = process.env.WISE_API_URL?.replace(/\/+$/, '');
 const API_URL =
   configuredUrl && ALLOWED_API_URLS.has(configuredUrl) ? configuredUrl : 'https://api.transferwise.com';
 
-/** Transfers in these states never moved money, so they aren't a duplicate. */
-const DEAD_STATUSES = new Set(['cancelled', 'funds_refunded', 'charged_back', 'unknown']);
+/**
+ * Only a cancelled transfer is dropped, because it is the one state that
+ * conclusively never sent money.
+ *
+ * Everything else is kept even when the money came back: `charged_back` is a
+ * reversal of a payment that did reach the recipient, `funds_refunded` means it
+ * went out and returned, and `unknown` is by definition unresolved. Treating
+ * any of those as "never paid" is how someone gets paid twice — and since the
+ * status travels with the warning and warnings can be dismissed, an unnecessary
+ * flag costs a click while a missing one costs a payment.
+ */
+const DEAD_STATUSES = new Set(['cancelled']);
 
 /** Guard rails — a 7-day window that blows past these is not what this is for. */
 const MAX_PAGES = 20;
@@ -121,28 +131,46 @@ async function fetchTransfers(token: string, profileId: number, since: Date, unt
   return { transfers: all, truncated: true };
 }
 
-/** Transfers carry a recipient account id, not an email — resolve them once each. */
-async function fetchAccounts(token: string, ids: number[]): Promise<Map<number, WiseAccount>> {
+/**
+ * Transfers carry a recipient account id, not an email — resolve them once each.
+ *
+ * Failures are counted rather than shrugged off. A transfer whose email we
+ * couldn't resolve is invisible to a check that matches on email, so silently
+ * dropping it turns a rate limit into a clean bill of health.
+ */
+async function fetchAccounts(
+  token: string,
+  ids: number[],
+): Promise<{ byId: Map<number, WiseAccount>; failed: number }> {
   const byId = new Map<number, WiseAccount>();
+  let failed = 0;
 
   for (let i = 0; i < ids.length; i += ACCOUNT_CONCURRENCY) {
     const chunk = ids.slice(i, i + ACCOUNT_CONCURRENCY);
     const results = await Promise.all(
       chunk.map(async (id) => {
-        try {
-          return await wise<WiseAccount>(`/v1/accounts/${id}`, token);
-        } catch {
-          // A deleted recipient still leaves its transfer in the list; we just
-          // can't name it. Losing one row beats failing the whole check.
-          return null;
+        // One retry, because a single blip shouldn't degrade the whole check.
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            return await wise<WiseAccount>(`/v1/accounts/${id}`, token);
+          } catch (e) {
+            if (attempt === 1) {
+              console.error(`Account ${id} lookup failed:`, e);
+              return null;
+            }
+          }
         }
+        return null;
       }),
     );
 
-    for (const account of results) if (account) byId.set(account.id, account);
+    for (const account of results) {
+      if (account) byId.set(account.id, account);
+      else failed++;
+    }
   }
 
-  return byId;
+  return { byId, failed };
 }
 
 function firstValue(v: string | string[] | undefined): string | undefined {
@@ -183,7 +211,10 @@ export default async function handler(req: Req, res: Res) {
     const live = transfers.filter((t) => !DEAD_STATUSES.has(t.status));
 
     const accountIds = [...new Set(live.map((t) => t.targetAccount).filter((id): id is number => id != null))];
-    const accounts = await fetchAccounts(token, accountIds.slice(0, MAX_ACCOUNT_LOOKUPS));
+    const { byId: accounts, failed } = await fetchAccounts(
+      token,
+      accountIds.slice(0, MAX_ACCOUNT_LOOKUPS),
+    );
 
     const payouts: WisePayout[] = live.map((t) => {
       const account = t.targetAccount != null ? accounts.get(t.targetAccount) : undefined;
@@ -200,6 +231,10 @@ export default async function handler(req: Req, res: Res) {
       };
     });
 
+    // Any transfer we couldn't pin an email to can't participate in the match,
+    // so it is reported rather than quietly missing.
+    const unresolved = payouts.filter((p) => !p.email).length;
+
     res.status(200).json({
       profileId,
       days,
@@ -208,6 +243,10 @@ export default async function handler(req: Req, res: Res) {
       count: payouts.length,
       /** True when the window held more transfers than we were willing to page through. */
       truncated: truncated || accountIds.length > MAX_ACCOUNT_LOOKUPS,
+      /** Recipient lookups that errored outright. */
+      lookupsFailed: failed,
+      /** Transfers with no usable email, so invisible to the comparison. */
+      unresolved,
       payouts,
     });
   } catch (e) {

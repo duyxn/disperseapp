@@ -27,6 +27,10 @@ export type PayoutsResponse = {
   until: string;
   count: number;
   truncated: boolean;
+  /** Recipient lookups that errored outright. */
+  lookupsFailed?: number;
+  /** Transfers with no usable email, so invisible to the comparison. */
+  unresolved?: number;
   payouts: WisePayout[];
 };
 
@@ -47,6 +51,10 @@ export type ParsedCsv = {
   rows: CsvRow[];
   /** Lines we couldn't read a recipient email out of. */
   problems: { line: number; raw: string; reason: string }[];
+  /** Every line of the source file, so an export can subtract from the original. */
+  lines: string[];
+  /** 0-based index of the header row within `lines`. */
+  headerIndex: number;
 };
 
 /** Split one CSV line, honouring double-quoted fields and "" escapes. */
@@ -96,7 +104,7 @@ export function parseWiseCsv(text: string): ParsedCsv {
   const lines = text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split('\n');
 
   const headerIndex = lines.findIndex((l) => l.trim());
-  if (headerIndex === -1) return { header: '', rows: [], problems: [] };
+  if (headerIndex === -1) return { header: '', rows: [], problems: [], lines, headerIndex: 0 };
 
   const header = lines[headerIndex];
   const headers = splitCsvLine(header).map((h) => h.toLowerCase());
@@ -140,19 +148,21 @@ export function parseWiseCsv(text: string): ParsedCsv {
     });
   }
 
-  return { header, rows, problems };
+  return { header, rows, problems, lines, headerIndex };
 }
 
 /**
  * Wise stamps some timestamps as `2026-07-20 11:44:56` with no zone marker,
  * which JS would read as local time. They are UTC.
  */
-export function parseWiseDate(value: string): number {
+export function parseWiseDate(value: string): number | null {
   const normalised = /[zZ]|[+-]\d{2}:?\d{2}$/.test(value)
     ? value.replace(' ', 'T')
     : `${value.replace(' ', 'T')}Z`;
   const ms = Date.parse(normalised);
-  return Number.isNaN(ms) ? 0 : ms;
+  // null, not 0: an unreadable date read as 1970 would silently fall outside
+  // every window, turning "we can't tell when this was paid" into "not paid".
+  return Number.isNaN(ms) ? null : ms;
 }
 
 /**
@@ -189,14 +199,17 @@ export function checkCsv(rows: CsvRow[], payouts: WisePayout[], windowDays: numb
   const priorByEmail = new Map<string, WisePayout[]>();
   for (const p of payouts) {
     if (!p.email) continue;
-    if (parseWiseDate(p.created) < cutoff) continue;
+    const created = parseWiseDate(p.created);
+    // An undateable payout is kept: not knowing when someone was paid is a
+    // reason to warn, not a reason to stay quiet.
+    if (created !== null && created < cutoff) continue;
     const list = priorByEmail.get(p.email);
     if (list) list.push(p);
     else priorByEmail.set(p.email, [p]);
   }
 
   for (const list of priorByEmail.values()) {
-    list.sort((a, b) => parseWiseDate(b.created) - parseWiseDate(a.created));
+    list.sort((a, b) => (parseWiseDate(b.created) ?? 0) - (parseWiseDate(a.created) ?? 0));
   }
 
   const flags: Flag[] = [];
@@ -217,13 +230,23 @@ export function checkCsv(rows: CsvRow[], payouts: WisePayout[], windowDays: numb
   return { flags, flaggedLines };
 }
 
-/** The original file minus the flagged rows, ready to upload to Wise. */
+/**
+ * The original file minus the flagged rows, ready to upload to Wise.
+ *
+ * Subtractive on purpose. Rebuilding from the rows we understood would drop
+ * every line we didn't — so a recipient whose row failed to parse would quietly
+ * disappear from the batch and never get paid at all. Only flagged lines are
+ * removed; anything else survives exactly as written.
+ */
 export function buildCleanCsv(parsed: ParsedCsv, flaggedLines: Set<number>): string {
-  const kept = parsed.rows.filter((r) => !flaggedLines.has(r.line)).map((r) => r.raw);
-  return [parsed.header, ...kept].join('\n') + '\n';
+  const body = parsed.lines
+    .slice(parsed.headerIndex)
+    .filter((_, offset) => !flaggedLines.has(parsed.headerIndex + offset + 1));
+  return body.join('\n').replace(/\n+$/, '') + '\n';
 }
 
-export function formatAge(timestamp: number, now: number): string {
+export function formatAge(timestamp: number | null, now: number): string {
+  if (timestamp === null) return 'at an unknown time';
   const mins = Math.max(0, Math.round((now - timestamp) / 60_000));
   if (mins < 60) return `${mins}m ago`;
   const hours = Math.round(mins / 60);
