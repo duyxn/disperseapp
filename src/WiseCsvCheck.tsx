@@ -53,6 +53,13 @@ export function WiseCsvCheck() {
     queryFn: () => fetchPayouts(days),
   });
 
+  // Acknowledged rows: the warning is advisory, so anything reviewed and judged
+  // intentional stops being flagged and stays in the exported file.
+  const [acknowledged, setAcknowledged] = useState<Set<number>>(new Set());
+
+  const acknowledge = (line: number) =>
+    setAcknowledged((prev) => new Set(prev).add(line));
+
   const now = Date.now();
 
   const result = useMemo(() => {
@@ -67,16 +74,22 @@ export function WiseCsvCheck() {
     const text = await file.text();
     setFilename(file.name);
     setParsed(parseWiseCsv(text));
+    // A new file's rows have nothing to do with what was acknowledged before.
+    setAcknowledged(new Set());
   }
+
+  // Acknowledging a row means "pay this one anyway", so it is kept on export.
+  const flags = (result?.flags ?? []).filter((f) => !acknowledged.has(f.row.line));
+  const removableLines = new Set(flags.map((f) => f.row.line));
 
   function handleDownloadClean() {
-    if (!parsed || !result) return;
+    if (!parsed) return;
     const base = filename.replace(/\.csv$/i, '') || 'wise-batch';
-    downloadCsv(`${base}-deduped.csv`, buildCleanCsv(parsed, result.flaggedLines));
+    downloadCsv(`${base}-deduped.csv`, buildCleanCsv(parsed, removableLines));
   }
 
-  const flags = result?.flags ?? [];
-  const cleanCount = parsed ? parsed.rows.length - (result?.flaggedLines.size ?? 0) : 0;
+  const cleanCount = parsed ? parsed.rows.length - removableLines.size : 0;
+  const acknowledgedCount = (result?.flags ?? []).length - flags.length;
 
   return (
     <>
@@ -160,8 +173,9 @@ export function WiseCsvCheck() {
         <div className="mb-4 rounded-lg bg-gray-900 p-6">
           {flags.length === 0 ? (
             <p className="text-sm text-green-400">
-              No recipient in this batch was paid in the last {days} day{days !== 1 && 's'}. Checked
-              against {history?.count ?? 0} Wise transfer{history?.count === 1 ? '' : 's'}.
+              {acknowledgedCount > 0
+                ? `All ${acknowledgedCount} flagged recipient${acknowledgedCount === 1 ? '' : 's'} acknowledged — nothing left to review.`
+                : `No recipient in this batch was paid in the last ${days} day${days === 1 ? '' : 's'}. Checked against ${history?.count ?? 0} Wise transfer${history?.count === 1 ? '' : 's'}.`}
             </p>
           ) : (
             <>
@@ -169,20 +183,42 @@ export function WiseCsvCheck() {
                 <h2 className="text-sm font-medium text-amber-400">
                   {flags.length} of {parsed?.rows.length} recipient
                   {flags.length !== 1 && 's'} flagged
+                  {acknowledgedCount > 0 && (
+                    <span className="text-amber-300/50"> · {acknowledgedCount} acknowledged</span>
+                  )}
                 </h2>
-                <button
-                  onClick={handleDownloadClean}
-                  disabled={cleanCount === 0}
-                  className="shrink-0 rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  Download CSV without them ({cleanCount})
-                </button>
+                <div className="flex shrink-0 gap-2">
+                  <button
+                    onClick={() =>
+                      setAcknowledged((prev) => {
+                        const next = new Set(prev);
+                        for (const f of flags) next.add(f.row.line);
+                        return next;
+                      })
+                    }
+                    className="rounded-md bg-amber-700/40 px-3 py-2 text-sm font-medium text-amber-100 transition hover:bg-amber-700/70"
+                  >
+                    Dismiss all
+                  </button>
+                  <button
+                    onClick={handleDownloadClean}
+                    disabled={cleanCount === 0}
+                    className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    Download CSV without them ({cleanCount})
+                  </button>
+                </div>
               </div>
+
+              <p className="mb-3 text-xs text-gray-500">
+                A warning, not a block — your original file is untouched. Dismiss the ones you mean
+                to pay, or download a copy without the rest.
+              </p>
 
               <div className="max-h-96 space-y-2 overflow-y-auto">
                 {flags.map((flag) => (
                   <div
-                    key={`${flag.kind}-${flag.row.line}`}
+                    key={flag.row.line}
                     className="rounded-md border border-amber-700/50 bg-amber-900/20 p-3"
                   >
                     <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -198,11 +234,14 @@ export function WiseCsvCheck() {
                     </div>
                     <p className="font-mono text-xs text-amber-300/60">{flag.row.email}</p>
 
-                    {flag.kind === 'repeat-in-file' ? (
+                    {/* Both reasons can apply to one row, so both are shown. */}
+                    {flag.firstLine != null && (
                       <p className="mt-1 text-xs text-amber-400/80">
                         Already appears on line {flag.firstLine} of this same file.
                       </p>
-                    ) : (
+                    )}
+
+                    {flag.prior.length > 0 && (
                       <div className="mt-1 space-y-0.5">
                         {flag.prior.slice(0, 4).map((p) => (
                           <p key={p.transferId} className="text-xs text-amber-400/80">
@@ -218,6 +257,13 @@ export function WiseCsvCheck() {
                         )}
                       </div>
                     )}
+
+                    <button
+                      onClick={() => acknowledge(flag.row.line)}
+                      className="mt-2 rounded-md bg-amber-700/40 px-3 py-1 text-xs font-medium text-amber-100 transition hover:bg-amber-700/70"
+                    >
+                      Pay anyway — dismiss
+                    </button>
                   </div>
                 ))}
               </div>

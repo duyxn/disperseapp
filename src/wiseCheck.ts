@@ -155,9 +155,18 @@ export function parseWiseDate(value: string): number {
   return Number.isNaN(ms) ? 0 : ms;
 }
 
-export type Flag =
-  | { kind: 'paid'; row: CsvRow; prior: WisePayout[] }
-  | { kind: 'repeat-in-file'; row: CsvRow; firstLine: number };
+/**
+ * One flagged row. The two reasons are independent and can both apply — a
+ * recipient can be a repeat within this file *and* already paid last week,
+ * and hiding the second behind the first is how you pay someone a third time.
+ */
+export type Flag = {
+  row: CsvRow;
+  /** Payouts already made to this recipient inside the window. */
+  prior: WisePayout[];
+  /** Where this recipient first appears in the file, when they repeat. */
+  firstLine?: number;
+};
 
 export type CheckResult = {
   flags: Flag[];
@@ -169,6 +178,10 @@ export type CheckResult = {
  * Flags rows that were already paid inside the window, plus rows that repeat a
  * recipient within the file itself — a batch that pays the same person twice
  * is the same mistake, one upload earlier.
+ *
+ * Every row is checked against the payout history, including repeats: the
+ * question being answered is per-recipient ("has this person been paid?"), so
+ * no row may be dropped from that check for any other reason.
  */
 export function checkCsv(rows: CsvRow[], payouts: WisePayout[], windowDays: number, now: number): CheckResult {
   const cutoff = now - windowDays * 24 * 60 * 60 * 1000;
@@ -192,18 +205,13 @@ export function checkCsv(rows: CsvRow[], payouts: WisePayout[], windowDays: numb
 
   for (const row of rows) {
     const firstLine = seenInFile.get(row.email);
-    if (firstLine != null) {
-      flags.push({ kind: 'repeat-in-file', row, firstLine });
-      flaggedLines.add(row.line);
-      continue;
-    }
-    seenInFile.set(row.email, row.line);
+    if (firstLine == null) seenInFile.set(row.email, row.line);
 
-    const prior = priorByEmail.get(row.email);
-    if (prior?.length) {
-      flags.push({ kind: 'paid', row, prior });
-      flaggedLines.add(row.line);
-    }
+    const prior = priorByEmail.get(row.email) ?? [];
+    if (prior.length === 0 && firstLine == null) continue;
+
+    flags.push({ row, prior, firstLine });
+    flaggedLines.add(row.line);
   }
 
   return { flags, flaggedLines };
