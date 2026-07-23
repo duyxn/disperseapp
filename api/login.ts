@@ -26,6 +26,7 @@ export default function handler(req: Req, res: Res) {
 
   const auth = checkPassword(req.headers['x-site-password'], clientIp(req.headers));
   if (!auth.ok) {
+    if (auth.retryAfter) res.setHeader('Retry-After', String(auth.retryAfter));
     res.status(auth.status).json({ error: auth.error });
     return;
   }

@@ -108,11 +108,16 @@ The browser keeps the password in `localStorage` and re-checks it against
 `/api/login` on every load, so rotating `SITE_PASSWORD` locks out browsers that
 still hold the old one.
 
-Wrong guesses are throttled per IP (10 per 15 minutes) before the password is
-compared. That counter lives in one warm serverless instance, so it resets on a
-cold start and a patient attacker spread across IPs will get past it — it raises
-the cost of a naive attack rather than preventing one. For a real limit, add a
-rate-limit rule on `/api/*` in the Vercel firewall.
+Wrong guesses are throttled per IP (20 per 10 minutes) before the password is
+compared, and a throttled response says how long the wait is. That counter lives
+in one warm serverless instance, so it resets on a cold start and a patient
+attacker spread across IPs will get past it — it raises the cost of a naive
+attack rather than preventing one. For a real limit, add a rate-limit rule on
+`/api/*` in the Vercel firewall.
+
+Note the limit is per IP, not per person, so everyone behind one office
+connection shares a bucket. Redeploying clears it immediately if you ever get
+stuck behind it.
 
 Note what this does and doesn't cover:
 

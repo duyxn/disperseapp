@@ -161,6 +161,7 @@ export default async function handler(req: Req, res: Res) {
   // payout data, which is why it's repeated here and not just on /api/login.
   const auth = checkPassword(req.headers['x-site-password'], clientIp(req.headers));
   if (!auth.ok) {
+    if (auth.retryAfter) res.setHeader('Retry-After', String(auth.retryAfter));
     res.status(auth.status).json({ error: auth.error });
     return;
   }

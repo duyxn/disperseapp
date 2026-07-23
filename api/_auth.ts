@@ -9,7 +9,9 @@
  */
 import { timingSafeEqual } from 'node:crypto';
 
-export type AuthResult = { ok: true } | { ok: false; status: number; error: string };
+export type AuthResult =
+  | { ok: true }
+  | { ok: false; status: number; error: string; retryAfter?: number };
 
 /**
  * Crude per-IP throttle on wrong guesses.
@@ -22,8 +24,14 @@ export type AuthResult = { ok: true } | { ok: false; status: number; error: stri
  * it. It raises the cost of a naive attack; it is not a real rate limiter. For
  * that, put a rate-limit rule on /api/* in the Vercel firewall.
  */
-const MAX_FAILURES = 10;
-const WINDOW_MS = 15 * 60 * 1000;
+/**
+ * Tuned so a person mistyping a password never reaches it, because being
+ * locked out of your own tool for a quarter of an hour — with no way to prove
+ * you know the password — is a worse outcome than a slightly slower attacker.
+ * Everyone behind one office IP shares a bucket, so this has to have headroom.
+ */
+const MAX_FAILURES = 20;
+const WINDOW_MS = 10 * 60 * 1000;
 const failures = new Map<string, { count: number; first: number }>();
 
 export function clientIp(headers: Record<string, string | string[] | undefined>): string {
@@ -33,14 +41,16 @@ export function clientIp(headers: Record<string, string | string[] | undefined>)
   return value?.split(',')[0]?.trim() || 'unknown';
 }
 
-function throttled(ip: string, now: number): boolean {
+/** Seconds until this IP may try again, or 0 when it isn't throttled. */
+function throttledFor(ip: string, now: number): number {
   const seen = failures.get(ip);
-  if (!seen) return false;
+  if (!seen) return 0;
   if (now - seen.first > WINDOW_MS) {
     failures.delete(ip);
-    return false;
+    return 0;
   }
-  return seen.count >= MAX_FAILURES;
+  if (seen.count < MAX_FAILURES) return 0;
+  return Math.max(1, Math.ceil((seen.first + WINDOW_MS - now) / 1000));
 }
 
 function recordFailure(ip: string, now: number): void {
@@ -72,8 +82,17 @@ export function checkPassword(
   }
 
   const now = Date.now();
-  if (throttled(ip, now)) {
-    return { ok: false, status: 429, error: 'Too many attempts. Try again later.' };
+  const retryAfter = throttledFor(ip, now);
+  if (retryAfter) {
+    const minutes = Math.ceil(retryAfter / 60);
+    return {
+      ok: false,
+      status: 429,
+      // Say how long: an unqualified "try again later" is indistinguishable
+      // from the password itself being wrong.
+      error: `Too many wrong attempts. Try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`,
+      retryAfter,
+    };
   }
 
   const value = Array.isArray(supplied) ? supplied[0] : supplied;
