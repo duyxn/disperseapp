@@ -5,7 +5,7 @@
  * good — on first entry, and on every load so that rotating SITE_PASSWORD
  * actually locks people out.
  */
-import { checkPassword, clientIp } from './_auth';
+import { checkPassword, clientIp } from './_auth.js';
 
 type Req = { method?: string; headers: Record<string, string | string[] | undefined> };
 type Res = {

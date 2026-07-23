@@ -8,7 +8,7 @@
  * GET /api/wise-payouts?days=7
  *   x-site-password: <SITE_PASSWORD>
  */
-import { checkPassword, clientIp } from './_auth';
+import { checkPassword, clientIp } from './_auth.js';
 
 type Req = { method?: string; query: Record<string, string | string[] | undefined>; headers: Record<string, string | string[] | undefined> };
 type Res = {
