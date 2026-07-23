@@ -8,6 +8,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { RainbowKitProvider, darkTheme } from '@rainbow-me/rainbowkit';
 import { config } from './wagmi';
 import App from './App';
+import { SiteGate } from './SiteGate';
 
 const queryClient = new QueryClient();
 
@@ -16,7 +17,9 @@ createRoot(document.getElementById('root')!).render(
     <WagmiProvider config={config}>
       <QueryClientProvider client={queryClient}>
         <RainbowKitProvider theme={darkTheme()}>
-          <App />
+          <SiteGate>
+            <App />
+          </SiteGate>
         </RainbowKitProvider>
       </QueryClientProvider>
     </WagmiProvider>

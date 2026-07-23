@@ -1,13 +1,27 @@
-import { useState, useMemo, useEffect } from 'react';
+import { useState, useMemo, useEffect, useCallback } from 'react';
 import { ConnectButton } from '@rainbow-me/rainbowkit';
 import {
   useAccount,
   useWriteContract,
   useWaitForTransactionReceipt,
   useReadContract,
+  usePublicClient,
 } from 'wagmi';
-import { parseEther, parseUnits, formatUnits, isAddress } from 'viem';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { parseEther, parseUnits, formatUnits, isAddress, type PublicClient } from 'viem';
 import { DISPERSE_ADDRESS, disperseAbi, erc20Abi } from './abi';
+import {
+  fetchRecentPayouts,
+  findDuplicate,
+  formatAgo,
+  mergePayouts,
+  readPendingPayouts,
+  recordPendingPayouts,
+  removePendingPayouts,
+  PENDING_TTL_MS,
+  type Payout,
+} from './payoutHistory';
+import { WiseCsvCheck } from './WiseCsvCheck';
 
 const USDC_ADDRESS = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48' as const;
 const USDT_ADDRESS = '0xdac17f958d2ee523a2206206994597c13d831ec7' as const;
@@ -15,6 +29,8 @@ const USDT_ADDRESS = '0xdac17f958d2ee523a2206206994597c13d831ec7' as const;
 type ParsedEntry = {
   address: `0x${string}`;
   amount: string;
+  /** 0-based index in the raw textarea, so a single line can be removed precisely. */
+  line: number;
 };
 
 type ParseResult = {
@@ -23,12 +39,14 @@ type ParseResult = {
 };
 
 function parseRecipients(input: string): ParseResult {
-  const lines = input.split('\n').filter((l) => l.trim());
+  const lines = input.split('\n');
   const valid: ParsedEntry[] = [];
   const errors: ParseResult['errors'] = [];
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
+    if (!line) continue;
+
     const parts = line.split(/[,\s=]+/).filter(Boolean);
 
     if (parts.length < 2) {
@@ -48,7 +66,7 @@ function parseRecipients(input: string): ParseResult {
       continue;
     }
 
-    valid.push({ address: addr as `0x${string}`, amount: amt });
+    valid.push({ address: addr as `0x${string}`, amount: amt, line: i });
   }
 
   return { valid, errors };
@@ -56,6 +74,7 @@ function parseRecipients(input: string): ParseResult {
 
 function App() {
   const { address: userAddress, isConnected } = useAccount();
+  const [page, setPage] = useState<'disperse' | 'wise'>('disperse');
   const [mode, setMode] = useState<'eth' | 'usdc' | 'usdt' | 'erc20'>('eth');
   const [customTokenAddress, setCustomTokenAddress] = useState('');
   const [recipientInput, setRecipientInput] = useState('');
@@ -118,6 +137,77 @@ function App() {
     return amounts.reduce((sum, v) => sum + v, 0n);
   }, [amounts]);
 
+  // Recent payout history, for the duplicate check
+  const publicClient = usePublicClient();
+  const queryClient = useQueryClient();
+
+  const { data: recentPayouts, isLoading: historyLoading, isError: historyFailed } = useQuery({
+    queryKey: ['recentPayouts', userAddress],
+    enabled: !!userAddress && !!publicClient,
+    staleTime: 60_000,
+    queryFn: (): Promise<Payout[]> =>
+      fetchRecentPayouts(publicClient as PublicClient, userAddress!, Date.now()),
+  });
+
+  // The pending overlay lives in state, not read straight from localStorage:
+  // storage writes and TTL expiry are invisible to React, so a memo reading it
+  // directly could show a stale warning — or miss a fresh one — indefinitely.
+  // Kept per wallet: a tx submitted by one account can resolve after the user
+  // has switched to another, and that late write must neither be checked
+  // against the new wallet's history nor displace its records.
+  const [pendingByOwner, setPendingByOwner] = useState<Record<string, Payout[]>>({});
+
+  const reloadPending = useCallback((sender: `0x${string}`) => {
+    setPendingByOwner((prev) => ({
+      ...prev,
+      [sender.toLowerCase()]: readPendingPayouts(sender, Date.now()),
+    }));
+  }, []);
+
+  useEffect(() => {
+    if (userAddress) reloadPending(userAddress);
+  }, [userAddress, reloadPending]);
+
+  const pendingPayouts = useMemo(
+    () => (userAddress ? (pendingByOwner[userAddress.toLowerCase()] ?? []) : []),
+    [pendingByOwner, userAddress],
+  );
+
+  // Nothing else re-renders when a record simply gets old, so drive expiry.
+  useEffect(() => {
+    if (pendingPayouts.length === 0) return;
+    const id = setInterval(() => {
+      setPendingByOwner((prev) => {
+        const now = Date.now();
+        let changed = false;
+        const next: Record<string, Payout[]> = {};
+
+        for (const [owner, payouts] of Object.entries(prev)) {
+          const kept = payouts.filter((p) => now - p.timestamp < PENDING_TTL_MS);
+          if (kept.length !== payouts.length) changed = true;
+          next[owner] = kept;
+        }
+
+        return changed ? next : prev;
+      });
+    }, 30_000);
+    return () => clearInterval(id);
+  }, [pendingPayouts.length]);
+
+  const duplicates = useMemo(() => {
+    if (!recentPayouts || !amounts) return [];
+    const now = Date.now();
+    const token = isToken ? (validTokenAddress ?? null) : null;
+    if (isToken && !token) return [];
+
+    const history = mergePayouts(recentPayouts, pendingPayouts);
+
+    return parsed.valid
+      .map((entry, i) => ({ entry, prior: findDuplicate(history, entry.address, token, amounts[i]) }))
+      .filter((d): d is { entry: ParsedEntry; prior: Payout } => d.prior !== null)
+      .map((d) => ({ ...d, ago: formatAgo(d.prior.timestamp, now) }));
+  }, [recentPayouts, pendingPayouts, amounts, parsed.valid, isToken, validTokenAddress]);
+
   // Allowance (ERC-20 only)
   const { data: currentAllowance, refetch: refetchAllowance } = useReadContract({
     address: validTokenAddress!,
@@ -159,7 +249,7 @@ function App() {
 
   // Disperse tx
   const {
-    writeContract: disperse,
+    writeContractAsync: disperse,
     data: disperseHash,
     error: disperseError,
     isPending: isDispersing,
@@ -170,28 +260,106 @@ function App() {
     hash: disperseHash,
   });
 
-  function handleDisperse() {
+  // Tracked outside the mutation: `resetDisperse` fires whenever the recipients
+  // or mode change, which would otherwise drop the tx we still need to follow.
+  // The sender is carried along so that switching accounts can't make cleanup
+  // target a different wallet's records.
+  const [submittedTx, setSubmittedTx] = useState<{ hash: `0x${string}`; sender: `0x${string}` } | null>(
+    null,
+  );
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [isAwaitingHash, setIsAwaitingHash] = useState(false);
+
+  const { isLoading: isSubmittedPending, isError: submittedFailed } = useWaitForTransactionReceipt({
+    hash: submittedTx?.hash,
+  });
+
+  // A reverted disperse paid nobody, and a revert is usually followed straight
+  // away by a retry — so it has to stop being flagged immediately rather than
+  // waiting out the pending TTL. Subtler outcomes (cancelled, replaced, dropped)
+  // are left to that expiry instead of being tracked here.
+  //
+  // wagmi's hook turns a reverted receipt into an error rather than resolving it
+  // with `status: 'reverted'`, and that same error covers transport failures —
+  // so the receipt is re-read directly to tell an actual revert from a hiccup.
+  useEffect(() => {
+    if (!submittedTx || !submittedFailed || !publicClient) return;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const receipt = await publicClient.getTransactionReceipt({ hash: submittedTx.hash });
+        if (cancelled || receipt.status !== 'reverted') return;
+        removePendingPayouts(submittedTx.sender, submittedTx.hash);
+        reloadPending(submittedTx.sender);
+        queryClient.invalidateQueries({ queryKey: ['recentPayouts', submittedTx.sender] });
+      } catch {
+        // Couldn't confirm the outcome — leave the record to expire on its own.
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [submittedTx, submittedFailed, publicClient, queryClient, reloadPending]);
+
+  async function handleDisperse() {
     if (!amounts || parsed.valid.length === 0) return;
 
     const addresses = parsed.valid.map((e) => e.address);
 
-    if (isToken && validTokenAddress) {
-      disperse({
-        address: DISPERSE_ADDRESS,
-        abi: disperseAbi,
-        functionName: 'disperseToken',
-        args: [validTokenAddress, addresses, amounts],
-      });
-    } else {
-      disperse({
-        address: DISPERSE_ADDRESS,
-        abi: disperseAbi,
-        functionName: 'disperseEther',
-        args: [addresses, amounts],
-        value: totalAmount,
-      });
+    // Snapshot what is actually being submitted. The user is free to edit the
+    // textarea or switch tokens while the wallet prompt is open, so reading
+    // state again once the hash arrives would record the wrong list.
+    const submitted = parsed.valid.map((e, i) => ({
+      recipient: e.address,
+      token: isToken ? (validTokenAddress ?? null) : null,
+      amount: amounts[i],
+    }));
+    const sender = userAddress;
+    setSubmitError(null);
+    // Covers the stretch before a hash exists: the wallet prompt is open, the
+    // mutation may be reset out from under us, and `submittedTx` isn't set yet.
+    setIsAwaitingHash(true);
+
+    let hash: `0x${string}`;
+    try {
+      hash =
+        isToken && validTokenAddress
+          ? await disperse({
+              address: DISPERSE_ADDRESS,
+              abi: disperseAbi,
+              functionName: 'disperseToken',
+              args: [validTokenAddress, addresses, amounts],
+            })
+          : await disperse({
+              address: DISPERSE_ADDRESS,
+              abi: disperseAbi,
+              functionName: 'disperseEther',
+              args: [addresses, amounts],
+              value: totalAmount,
+            });
+    } catch (e) {
+      // Held independently of the mutation: `resetDisperse` detaches it, so
+      // `disperseError` alone would silently drop this.
+      setSubmitError(e instanceof Error ? e.message : String(e));
+      return;
+    } finally {
+      setIsAwaitingHash(false);
     }
+
+    if (!sender) return;
+    setSubmittedTx({ hash, sender });
+    recordPendingPayouts(sender, submitted, hash, Date.now());
+    reloadPending(sender);
+    // Pick up the confirmed on-chain record without waiting for staleness.
+    queryClient.invalidateQueries({ queryKey: ['recentPayouts', sender] });
   }
+
+  // `isSubmittedPending` follows the tx independently of the mutation, which
+  // `resetDisperse` clears whenever recipients or mode change — without it,
+  // editing the list mid-flight would re-enable the button for a second send.
+  const isSending = isDispersing || isConfirming || isSubmittedPending || isAwaitingHash;
 
   const canSend =
     isConnected &&
@@ -210,6 +378,28 @@ function App() {
           <ConnectButton />
         </div>
 
+        {/* Page Selector */}
+        <div className="mb-4 flex gap-2">
+          {([
+            ['disperse', 'On-chain disperse'],
+            ['wise', 'Wise CSV check'],
+          ] as const).map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setPage(key)}
+              className={`rounded-md px-4 py-2 text-sm font-medium transition ${
+                page === key ? 'bg-gray-800 text-white' : 'text-gray-500 hover:text-gray-300'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {page === 'wise' && <WiseCsvCheck />}
+
+        {page === 'disperse' && (
+          <>
         {/* Token Selector */}
         <div className="mb-4 rounded-lg bg-gray-900 p-6">
           <div className="mb-4 flex gap-4">
@@ -327,6 +517,53 @@ function App() {
               </button>
             </div>
           )}
+
+          {/* Warning: recipients already paid a similar amount recently */}
+          {historyLoading && parsed.valid.length > 0 && (
+            <p className="mt-3 text-sm text-gray-500">Checking recent payouts...</p>
+          )}
+
+          {historyFailed && parsed.valid.length > 0 && (
+            <p className="mt-3 text-sm text-amber-500/80">
+              Could not load recent payout history — duplicates were not checked.
+            </p>
+          )}
+
+          {duplicates.length > 0 && (
+            <div className="mt-3 rounded-md bg-amber-900/30 border border-amber-700/50 p-3">
+              <p className="text-sm font-medium text-amber-400 mb-2">
+                Warning: {duplicates.length} recipient{duplicates.length !== 1 && 's'} already paid a
+                similar amount in the last 3 days
+              </p>
+              <div className="space-y-1">
+                {duplicates.map((d, i) => (
+                  <div key={i} className="flex items-center justify-between gap-4 text-sm">
+                    <span className="font-mono text-amber-300/70">
+                      {d.entry.address.slice(0, 10)}...{d.entry.address.slice(-8)} — {d.entry.amount}
+                    </span>
+                    <span className="shrink-0 text-amber-300/50">
+                      paid {formatUnits(d.prior.amount, decimals)} {d.ago}
+                      {d.prior.pending && ' (pending)'}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              <button
+                onClick={() => {
+                  // By line, not by address: the same recipient may legitimately
+                  // appear again with an amount that wasn't flagged.
+                  const flagged = new Set(duplicates.map((d) => d.entry.line));
+                  const kept = recipientInput
+                    .split('\n')
+                    .filter((_, i) => !flagged.has(i));
+                  setRecipientInput(kept.join('\n'));
+                }}
+                className="mt-2 rounded-md bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-500 transition"
+              >
+                Remove flagged lines
+              </button>
+            </div>
+          )}
         </div>
 
         {/* Summary */}
@@ -374,7 +611,7 @@ function App() {
 
           <button
             onClick={handleDisperse}
-            disabled={!canSend || isDispersing || isConfirming}
+            disabled={!canSend || isSending}
             className="flex-1 rounded-lg bg-blue-600 py-3 font-medium text-white transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
           >
             {isDispersing
@@ -405,14 +642,19 @@ function App() {
           </div>
         )}
 
-        {disperseError && (
+        {(disperseError ?? submitError) && (
           <div className="mt-4 rounded-lg bg-red-900/30 p-4">
             <p className="text-sm text-red-400">
-              {disperseError.message.includes('User rejected')
-                ? 'Transaction rejected'
-                : disperseError.message.slice(0, 200)}
+              {(() => {
+                const message = disperseError?.message ?? submitError ?? '';
+                return message.includes('User rejected')
+                  ? 'Transaction rejected'
+                  : message.slice(0, 200);
+              })()}
             </p>
           </div>
+        )}
+          </>
         )}
       </div>
     </div>
