@@ -533,7 +533,7 @@ function App() {
             <div className="mt-3 rounded-md bg-amber-900/30 border border-amber-700/50 p-3">
               <p className="text-sm font-medium text-amber-400 mb-2">
                 Warning: {duplicates.length} recipient{duplicates.length !== 1 && 's'} already paid a
-                similar amount in the last 3 days
+                similar amount in the last 7 days
               </p>
               <div className="space-y-1">
                 {duplicates.map((d, i) => (

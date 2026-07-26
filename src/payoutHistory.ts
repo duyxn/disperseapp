@@ -2,13 +2,13 @@ import { decodeFunctionData, type Address, type Hex, type PublicClient } from 'v
 import { DISPERSE_ADDRESS, disperseAbi } from './abi';
 
 /** How far back we look for prior payouts. */
-export const DUPLICATE_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
+export const DUPLICATE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** Amounts within this fraction of a prior payout count as the same payment. */
 export const DUPLICATE_TOLERANCE = 0.01;
 
-/** ~3 days of blocks at 12s, with slack for faster-than-nominal periods. */
-const WINDOW_BLOCKS = 22_000n;
+/** ~7 days of blocks at 12s, with slack for faster-than-nominal periods. */
+const WINDOW_BLOCKS = 51_000n;
 
 const ALCHEMY_URL = `https://eth-mainnet.g.alchemy.com/v2/${import.meta.env.VITE_ALCHEMY_API_KEY}`;
 
@@ -36,7 +36,7 @@ async function getAssetTransfers(params: Record<string, unknown>): Promise<Alche
   const out: AlchemyTransfer[] = [];
   let pageKey: string | undefined;
 
-  // Bounded: a wallet with more than 5k outbound transfers in 3 days is not the
+  // Bounded: a wallet with more than 5k outbound transfers in 7 days is not the
   // case this check is for, and we'd rather degrade than hammer the RPC.
   for (let page = 0; page < 5; page++) {
     const res = await fetch(ALCHEMY_URL, {
