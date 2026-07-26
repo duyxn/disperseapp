@@ -19,6 +19,7 @@ import {
   recordPendingPayouts,
   removePendingPayouts,
   walletsToCheck,
+  isKnownSender,
   PENDING_TTL_MS,
   type Payout,
 } from './payoutHistory';
@@ -145,6 +146,10 @@ function App() {
   // Every configured sending wallet is checked, not just the connected one —
   // a repeat is only visible if we look at the wallet that made the first send.
   const checkedWallets = useMemo(() => walletsToCheck(userAddress), [userAddress]);
+
+  // Connected but unlisted means this wallet's own past sends aren't in
+  // SENDER_WALLETS, so a duplicate from it would slip through unseen.
+  const unlistedSender = isConnected && !!userAddress && !isKnownSender(userAddress);
 
   const { data: recentPayouts, isLoading: historyLoading, isError: historyFailed } = useQuery({
     queryKey: ['recentPayouts', checkedWallets.map((w) => w.toLowerCase()).sort()],
@@ -596,6 +601,26 @@ function App() {
             <div className="mt-3 border-t border-gray-800 pt-3 text-right text-sm font-medium">
               Total: {formatUnits(totalAmount, decimals)} {isToken ? (tokenSymbol ?? 'tokens') : 'ETH'}
             </div>
+          </div>
+        )}
+
+        {/* Unlisted-wallet guard: this wallet's own history was not compared. */}
+        {unlistedSender && (
+          <div className="mb-4 rounded-lg bg-red-900/40 border border-red-600/60 p-4">
+            <p className="text-sm font-medium text-red-300">
+              You're connected as{' '}
+              <span className="font-mono">
+                {userAddress!.slice(0, 8)}…{userAddress!.slice(-6)}
+              </span>
+              , which isn't in your checked-wallets list — its own past sends were{' '}
+              <span className="font-semibold">not compared</span>, so a duplicate from this wallet
+              could slip through.
+            </p>
+            <p className="mt-2 text-xs text-red-300/70">
+              If you send from this wallet regularly, add it to{' '}
+              <span className="font-mono">SENDER_WALLETS</span> in{' '}
+              <span className="font-mono">src/payoutHistory.ts</span>.
+            </p>
           </div>
         )}
 

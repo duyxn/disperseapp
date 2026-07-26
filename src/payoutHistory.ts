@@ -22,6 +22,12 @@ export const SENDER_WALLETS: Address[] = [
   '0x858689198a3ab2e88846ae5e9d8f905aeb251205',
 ];
 
+/** True when this wallet is one whose history the check actually compares. */
+export function isKnownSender(wallet: Address | undefined): boolean {
+  if (!wallet) return false;
+  return SENDER_WALLETS.some((w) => w.toLowerCase() === wallet.toLowerCase());
+}
+
 /** The connected wallet plus every configured sender, de-duplicated. */
 export function walletsToCheck(connected: Address | undefined): Address[] {
   const seen = new Set<string>();
