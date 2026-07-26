@@ -2,13 +2,38 @@ import { decodeFunctionData, type Address, type Hex, type PublicClient } from 'v
 import { DISPERSE_ADDRESS, disperseAbi } from './abi';
 
 /** How far back we look for prior payouts. */
-export const DUPLICATE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+export const DUPLICATE_WINDOW_MS = 10 * 24 * 60 * 60 * 1000;
 
-/** Amounts within this fraction of a prior payout count as the same payment. */
-export const DUPLICATE_TOLERANCE = 0.01;
+/** ~10 days of blocks at 12s, with slack for faster-than-nominal periods. */
+const WINDOW_BLOCKS = 73_000n;
 
-/** ~7 days of blocks at 12s, with slack for faster-than-nominal periods. */
-const WINDOW_BLOCKS = 51_000n;
+/**
+ * Every wallet you send disperses from.
+ *
+ * The check reads the chain, not a database, so it can only catch a repeat if it
+ * looks at the wallet that actually made the earlier payment. Sending from one
+ * wallet and re-sending from another is exactly how a recipient gets paid twice
+ * without either wallet's own history showing it — so all of them are always
+ * checked, whichever one is currently connected. Add a new sending wallet here
+ * the day you start using it, or a payment from it will be invisible to this.
+ */
+export const SENDER_WALLETS: Address[] = [
+  '0x3f128b6703f4004bf5eb169ba6e9af1cba4af8df',
+  '0x858689198a3ab2e88846ae5e9d8f905aeb251205',
+];
+
+/** The connected wallet plus every configured sender, de-duplicated. */
+export function walletsToCheck(connected: Address | undefined): Address[] {
+  const seen = new Set<string>();
+  const out: Address[] = [];
+  for (const w of [...(connected ? [connected] : []), ...SENDER_WALLETS]) {
+    const key = w.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(w);
+  }
+  return out;
+}
 
 const ALCHEMY_URL = `https://eth-mainnet.g.alchemy.com/v2/${import.meta.env.VITE_ALCHEMY_API_KEY}`;
 
@@ -19,6 +44,8 @@ export type Payout = {
   amount: bigint;
   timestamp: number;
   hash: Hex;
+  /** Which of your wallets sent it. */
+  sender: Address;
   /** Submitted from this browser but not yet visible to the indexer. */
   pending?: boolean;
 };
@@ -147,7 +174,7 @@ export async function fetchRecentPayouts(
 
     const amount = transferAmount(t);
     if (amount == null || amount === 0n) return;
-    payouts.push({ recipient: t.to, token, amount, timestamp, hash: t.hash });
+    payouts.push({ recipient: t.to, token, amount, timestamp, hash: t.hash, sender: user });
   };
 
   for (const t of erc20) collect(t, t.rawContract?.address ?? null);
@@ -180,6 +207,7 @@ export async function fetchRecentPayouts(
         amount: values[i] ?? 0n,
         timestamp,
         hash,
+        sender: user,
       })) satisfies Payout[];
     }
 
@@ -191,6 +219,7 @@ export async function fetchRecentPayouts(
         amount: values[i] ?? 0n,
         timestamp,
         hash,
+        sender: user,
       })) satisfies Payout[];
     }
 
@@ -201,11 +230,16 @@ export async function fetchRecentPayouts(
   return payouts;
 }
 
-/** True when `a` is within the tolerance band around the earlier amount `b`. */
-export function amountsMatch(a: bigint, b: bigint): boolean {
-  if (b === 0n) return a === 0n;
-  const diff = a > b ? a - b : b - a;
-  return diff * 10_000n <= b * BigInt(Math.round(DUPLICATE_TOLERANCE * 10_000));
+/** Every payment made by any of the given wallets in the window, merged. */
+export async function fetchPayoutsForWallets(
+  client: PublicClient,
+  wallets: Address[],
+  now: number,
+): Promise<Payout[]> {
+  // A failure in any wallet's fetch must fail the whole check rather than
+  // quietly omit that wallet's payments — a partial history is a false all-clear.
+  const perWallet = await Promise.all(wallets.map((w) => fetchRecentPayouts(client, w, now)));
+  return perWallet.flat();
 }
 
 function sameToken(a: Address | null, b: Address | null): boolean {
@@ -213,19 +247,26 @@ function sameToken(a: Address | null, b: Address | null): boolean {
   return a.toLowerCase() === b.toLowerCase();
 }
 
-/** The most recent prior payout matching this recipient, token, and amount. */
+/**
+ * The most recent prior payment to this recipient, of the same asset, from any
+ * of your wallets.
+ *
+ * Amount is deliberately not part of the match: the question is "did I already
+ * pay this wallet?", not "did I pay it this exact figure?". Re-runs that owe a
+ * different amount the second time (a corrected balance, an added review) are
+ * still the same recipient being paid twice, and matching on amount would let
+ * every one of those through.
+ */
 export function findDuplicate(
   payouts: Payout[],
   recipient: Address,
   token: Address | null,
-  amount: bigint,
 ): Payout | null {
   let best: Payout | null = null;
 
   for (const p of payouts) {
     if (p.recipient.toLowerCase() !== recipient.toLowerCase()) continue;
     if (!sameToken(p.token, token)) continue;
-    if (!amountsMatch(amount, p.amount)) continue;
     if (!best || p.timestamp > best.timestamp) best = p;
   }
 
@@ -273,7 +314,7 @@ export function readPendingPayouts(user: Address, now: number): Payout[] {
 
     return stored
       .filter((p) => p.timestamp >= cutoff)
-      .map((p) => ({ ...p, amount: BigInt(p.amount), pending: true }));
+      .map((p) => ({ ...p, amount: BigInt(p.amount), sender: user, pending: true }));
   } catch {
     return [];
   }

@@ -11,13 +11,14 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { parseEther, parseUnits, formatUnits, isAddress, type PublicClient } from 'viem';
 import { DISPERSE_ADDRESS, disperseAbi, erc20Abi } from './abi';
 import {
-  fetchRecentPayouts,
+  fetchPayoutsForWallets,
   findDuplicate,
   formatAgo,
   mergePayouts,
   readPendingPayouts,
   recordPendingPayouts,
   removePendingPayouts,
+  walletsToCheck,
   PENDING_TTL_MS,
   type Payout,
 } from './payoutHistory';
@@ -141,12 +142,16 @@ function App() {
   const publicClient = usePublicClient();
   const queryClient = useQueryClient();
 
+  // Every configured sending wallet is checked, not just the connected one —
+  // a repeat is only visible if we look at the wallet that made the first send.
+  const checkedWallets = useMemo(() => walletsToCheck(userAddress), [userAddress]);
+
   const { data: recentPayouts, isLoading: historyLoading, isError: historyFailed } = useQuery({
-    queryKey: ['recentPayouts', userAddress],
-    enabled: !!userAddress && !!publicClient,
+    queryKey: ['recentPayouts', checkedWallets.map((w) => w.toLowerCase()).sort()],
+    enabled: checkedWallets.length > 0 && !!publicClient,
     staleTime: 60_000,
     queryFn: (): Promise<Payout[]> =>
-      fetchRecentPayouts(publicClient as PublicClient, userAddress!, Date.now()),
+      fetchPayoutsForWallets(publicClient as PublicClient, checkedWallets, Date.now()),
   });
 
   // The pending overlay lives in state, not read straight from localStorage:
@@ -203,7 +208,7 @@ function App() {
     const history = mergePayouts(recentPayouts, pendingPayouts);
 
     return parsed.valid
-      .map((entry, i) => ({ entry, prior: findDuplicate(history, entry.address, token, amounts[i]) }))
+      .map((entry) => ({ entry, prior: findDuplicate(history, entry.address, token) }))
       .filter((d): d is { entry: ParsedEntry; prior: Payout } => d.prior !== null)
       .map((d) => ({ ...d, ago: formatAgo(d.prior.timestamp, now) }));
   }, [recentPayouts, pendingPayouts, amounts, parsed.valid, isToken, validTokenAddress]);
@@ -532,8 +537,8 @@ function App() {
           {duplicates.length > 0 && (
             <div className="mt-3 rounded-md bg-amber-900/30 border border-amber-700/50 p-3">
               <p className="text-sm font-medium text-amber-400 mb-2">
-                Warning: {duplicates.length} recipient{duplicates.length !== 1 && 's'} already paid a
-                similar amount in the last 7 days
+                Warning: {duplicates.length} recipient{duplicates.length !== 1 && 's'} already paid in
+                the last 10 days (across all {checkedWallets.length} of your wallets)
               </p>
               <div className="space-y-1">
                 {duplicates.map((d, i) => (
@@ -542,7 +547,8 @@ function App() {
                       {d.entry.address.slice(0, 10)}...{d.entry.address.slice(-8)} — {d.entry.amount}
                     </span>
                     <span className="shrink-0 text-amber-300/50">
-                      paid {formatUnits(d.prior.amount, decimals)} {d.ago}
+                      paid {formatUnits(d.prior.amount, decimals)} {d.ago} from{' '}
+                      {d.prior.sender.slice(0, 6)}...{d.prior.sender.slice(-4)}
                       {d.prior.pending && ' (pending)'}
                     </span>
                   </div>
