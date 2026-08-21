@@ -1,11 +1,43 @@
 import { decodeFunctionData, type Address, type Hex, type PublicClient } from 'viem';
 import { DISPERSE_ADDRESS, disperseAbi } from './abi';
 
-/** How far back we look for prior payouts. */
-export const DUPLICATE_WINDOW_MS = 10 * 24 * 60 * 60 * 1000;
+export const DAY_MS = 24 * 60 * 60 * 1000;
 
-/** ~10 days of blocks at 12s, with slack for faster-than-nominal periods. */
-const WINDOW_BLOCKS = 73_000n;
+/** How far back we look for prior payouts, unless the user changes it. */
+export const DEFAULT_WINDOW_DAYS = 10;
+
+/**
+ * The longest look-back offered. Past this the Alchemy page cap starts biting
+ * for an active wallet, and a truncated history is a false all-clear.
+ */
+export const MAX_WINDOW_DAYS = 90;
+
+export function clampWindowDays(days: number): number {
+  if (!Number.isFinite(days)) return DEFAULT_WINDOW_DAYS;
+  return Math.min(MAX_WINDOW_DAYS, Math.max(1, Math.floor(days)));
+}
+
+/**
+ * Look-backs we actually fetch at.
+ *
+ * The window is a control the user nudges, and every distinct value would
+ * otherwise be its own multi-wallet RPC sweep — including each intermediate
+ * value typed on the way to the one they meant. Fetching a superset and
+ * trimming to the exact window in `findDuplicates` keeps that to one sweep per
+ * tier, and makes narrowing the window instant.
+ */
+const FETCH_TIERS = [1, 3, 7, 14, 30, 60, MAX_WINDOW_DAYS];
+
+/** The tier a given look-back is served from. Always >= `days`. */
+export function fetchWindowDays(days: number): number {
+  const wanted = clampWindowDays(days);
+  return FETCH_TIERS.find((t) => t >= wanted) ?? MAX_WINDOW_DAYS;
+}
+
+/** Blocks spanning `days` at 12s each, with slack for faster-than-nominal periods. */
+function windowBlocks(days: number): bigint {
+  return BigInt(Math.ceil((days * DAY_MS * 1.02) / 12_000));
+}
 
 /**
  * Every wallet you send disperses from.
@@ -141,10 +173,12 @@ export async function fetchRecentPayouts(
   client: PublicClient,
   user: Address,
   now: number,
+  days: number,
 ): Promise<Payout[]> {
+  const blocks = windowBlocks(days);
   const latestBlock = await client.getBlockNumber();
-  const fromBlock = `0x${(latestBlock > WINDOW_BLOCKS ? latestBlock - WINDOW_BLOCKS : 0n).toString(16)}`;
-  const cutoff = now - DUPLICATE_WINDOW_MS;
+  const fromBlock = `0x${(latestBlock > blocks ? latestBlock - blocks : 0n).toString(16)}`;
+  const cutoff = now - days * DAY_MS;
 
   const [erc20, external] = await Promise.all([
     getAssetTransfers({
@@ -241,10 +275,11 @@ export async function fetchPayoutsForWallets(
   client: PublicClient,
   wallets: Address[],
   now: number,
+  days: number,
 ): Promise<Payout[]> {
   // A failure in any wallet's fetch must fail the whole check rather than
   // quietly omit that wallet's payments — a partial history is a false all-clear.
-  const perWallet = await Promise.all(wallets.map((w) => fetchRecentPayouts(client, w, now)));
+  const perWallet = await Promise.all(wallets.map((w) => fetchRecentPayouts(client, w, now, days)));
   return perWallet.flat();
 }
 
@@ -254,29 +289,55 @@ function sameToken(a: Address | null, b: Address | null): boolean {
 }
 
 /**
- * The most recent prior payment to this recipient, of the same asset, from any
- * of your wallets.
+ * Narrows which prior payments count as a duplicate.
  *
- * Amount is deliberately not part of the match: the question is "did I already
- * pay this wallet?", not "did I pay it this exact figure?". Re-runs that owe a
- * different amount the second time (a corrected balance, an added review) are
- * still the same recipient being paid twice, and matching on amount would let
- * every one of those through.
+ * `amount`/`tolerance` are the opt-in half. By default amount is deliberately
+ * not part of the match: the question is "did I already pay this wallet?", not
+ * "did I pay it this exact figure?". Re-runs that owe a different amount the
+ * second time (a corrected balance, an added review) are still the same
+ * recipient being paid twice, and matching on amount would let every one of
+ * those through. But when you already know a batch legitimately re-pays the
+ * same people different sums, near-equal amounts are the signal worth keeping
+ * and everything else is noise — so it's offered, off by default.
  */
-export function findDuplicate(
+export type DuplicateFilter = {
+  /** Ignore anything paid before this instant. */
+  cutoff: number;
+  /** The amount about to be sent. Only matched when `tolerance` is also set. */
+  amount?: bigint;
+  /** Max absolute difference from `amount`, in the token's own units. */
+  tolerance?: bigint;
+};
+
+function withinTolerance(a: bigint, b: bigint, tolerance: bigint): boolean {
+  return (a > b ? a - b : b - a) <= tolerance;
+}
+
+/**
+ * Every prior payment to this recipient, of the same asset, from any of your
+ * wallets, inside the window — most recent first.
+ *
+ * All matches are returned, not just the latest: someone paid three times in
+ * the window is a bigger problem than someone paid once, and collapsing that to
+ * a single line hides it.
+ */
+export function findDuplicates(
   payouts: Payout[],
   recipient: Address,
   token: Address | null,
-): Payout | null {
-  let best: Payout | null = null;
+  filter: DuplicateFilter,
+): Payout[] {
+  const { cutoff, amount, tolerance } = filter;
 
-  for (const p of payouts) {
-    if (p.recipient.toLowerCase() !== recipient.toLowerCase()) continue;
-    if (!sameToken(p.token, token)) continue;
-    if (!best || p.timestamp > best.timestamp) best = p;
-  }
-
-  return best;
+  return payouts
+    .filter(
+      (p) =>
+        p.recipient.toLowerCase() === recipient.toLowerCase() &&
+        sameToken(p.token, token) &&
+        p.timestamp >= cutoff &&
+        (amount == null || tolerance == null || withinTolerance(p.amount, amount, tolerance)),
+    )
+    .sort((a, b) => b.timestamp - a.timestamp);
 }
 
 // --- Pending overlay -------------------------------------------------------

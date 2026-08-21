@@ -12,7 +12,7 @@ import { parseEther, parseUnits, formatUnits, isAddress, type PublicClient } fro
 import { DISPERSE_ADDRESS, disperseAbi, erc20Abi } from './abi';
 import {
   fetchPayoutsForWallets,
-  findDuplicate,
+  findDuplicates,
   formatAgo,
   mergePayouts,
   readPendingPayouts,
@@ -20,6 +20,11 @@ import {
   removePendingPayouts,
   walletsToCheck,
   isKnownSender,
+  clampWindowDays,
+  fetchWindowDays,
+  DAY_MS,
+  DEFAULT_WINDOW_DAYS,
+  MAX_WINDOW_DAYS,
   PENDING_TTL_MS,
   type Payout,
 } from './payoutHistory';
@@ -80,6 +85,11 @@ function App() {
   const [mode, setMode] = useState<'eth' | 'usdc' | 'usdt' | 'erc20'>('eth');
   const [customTokenAddress, setCustomTokenAddress] = useState('');
   const [recipientInput, setRecipientInput] = useState('');
+
+  // Duplicate-check settings.
+  const [windowDays, setWindowDays] = useState(DEFAULT_WINDOW_DAYS);
+  const [amountFilterOn, setAmountFilterOn] = useState(false);
+  const [toleranceInput, setToleranceInput] = useState('5');
 
   const isToken = mode !== 'eth';
   const tokenAddress = mode === 'usdc' ? USDC_ADDRESS : mode === 'usdt' ? USDT_ADDRESS : customTokenAddress;
@@ -151,12 +161,16 @@ function App() {
   // SENDER_WALLETS, so a duplicate from it would slip through unseen.
   const unlistedSender = isConnected && !!userAddress && !isKnownSender(userAddress);
 
+  // Served from a tier at least as wide as the window asked for, so narrowing
+  // the look-back re-filters in place instead of re-reading the chain.
+  const fetchDays = fetchWindowDays(windowDays);
+
   const { data: recentPayouts, isLoading: historyLoading, isError: historyFailed } = useQuery({
-    queryKey: ['recentPayouts', checkedWallets.map((w) => w.toLowerCase()).sort()],
+    queryKey: ['recentPayouts', checkedWallets.map((w) => w.toLowerCase()).sort(), fetchDays],
     enabled: checkedWallets.length > 0 && !!publicClient,
     staleTime: 60_000,
     queryFn: (): Promise<Payout[]> =>
-      fetchPayoutsForWallets(publicClient as PublicClient, checkedWallets, Date.now()),
+      fetchPayoutsForWallets(publicClient as PublicClient, checkedWallets, Date.now(), fetchDays),
   });
 
   // The pending overlay lives in state, not read straight from localStorage:
@@ -204,19 +218,71 @@ function App() {
     return () => clearInterval(id);
   }, [pendingPayouts.length]);
 
-  const duplicates = useMemo(() => {
-    if (!recentPayouts || !amounts) return [];
+  // `null` means "don't narrow by amount" — the filter is off, or what's typed
+  // isn't a usable figure. Both fall back to flagging every repeat, because the
+  // failure that matters here is a duplicate slipping through unseen.
+  const tolerance = useMemo(() => {
+    if (!amountFilterOn) return null;
+    const raw = toleranceInput.trim();
+    if (!raw) return null;
+    try {
+      const value = parseUnits(raw, decimals);
+      return value >= 0n ? value : null;
+    } catch {
+      return null;
+    }
+  }, [amountFilterOn, toleranceInput, decimals]);
+
+  const toleranceInvalid = amountFilterOn && tolerance === null;
+
+  const { duplicates, hiddenByAmount } = useMemo((): {
+    duplicates: { entry: ParsedEntry; priors: (Payout & { ago: string })[] }[];
+    hiddenByAmount: number;
+  } => {
+    const empty = { duplicates: [], hiddenByAmount: 0 };
+    if (!recentPayouts || !amounts) return empty;
     const now = Date.now();
     const token = isToken ? (validTokenAddress ?? null) : null;
-    if (isToken && !token) return [];
+    if (isToken && !token) return empty;
 
     const history = mergePayouts(recentPayouts, pendingPayouts);
+    const cutoff = now - windowDays * DAY_MS;
 
-    return parsed.valid
-      .map((entry) => ({ entry, prior: findDuplicate(history, entry.address, token) }))
-      .filter((d): d is { entry: ParsedEntry; prior: Payout } => d.prior !== null)
-      .map((d) => ({ ...d, ago: formatAgo(d.prior.timestamp, now) }));
-  }, [recentPayouts, pendingPayouts, amounts, parsed.valid, isToken, validTokenAddress]);
+    const perEntry = parsed.valid.map((entry, i) => {
+      // Both passes are run so the amount filter can say what it suppressed —
+      // a narrowing that hides matches without admitting it reads as an
+      // all-clear, which is the one thing this check must never fake.
+      const inWindow = findDuplicates(history, entry.address, token, { cutoff });
+      const priors =
+        tolerance === null
+          ? inWindow
+          : findDuplicates(history, entry.address, token, {
+              cutoff,
+              amount: amounts[i],
+              tolerance,
+            });
+
+      return {
+        entry,
+        priors: priors.map((p) => ({ ...p, ago: formatAgo(p.timestamp, now) })),
+        suppressed: priors.length === 0 && inWindow.length > 0,
+      };
+    });
+
+    return {
+      duplicates: perEntry.filter((d) => d.priors.length > 0),
+      hiddenByAmount: perEntry.filter((d) => d.suppressed).length,
+    };
+  }, [
+    recentPayouts,
+    pendingPayouts,
+    amounts,
+    parsed.valid,
+    isToken,
+    validTokenAddress,
+    windowDays,
+    tolerance,
+  ]);
 
   // Allowance (ERC-20 only)
   const { data: currentAllowance, refetch: refetchAllowance } = useReadContract({
@@ -302,7 +368,10 @@ function App() {
         if (cancelled || receipt.status !== 'reverted') return;
         removePendingPayouts(submittedTx.sender, submittedTx.hash);
         reloadPending(submittedTx.sender);
-        queryClient.invalidateQueries({ queryKey: ['recentPayouts', submittedTx.sender] });
+        // Every window tier is invalidated, not just the one on screen: the key
+        // carries the checked wallets and the tier, so a sender-shaped key
+        // matches nothing and the stale history would survive the revert.
+        queryClient.invalidateQueries({ queryKey: ['recentPayouts'] });
       } catch {
         // Couldn't confirm the outcome — leave the record to expire on its own.
       }
@@ -363,7 +432,7 @@ function App() {
     recordPendingPayouts(sender, submitted, hash, Date.now());
     reloadPending(sender);
     // Pick up the confirmed on-chain record without waiting for staleness.
-    queryClient.invalidateQueries({ queryKey: ['recentPayouts', sender] });
+    queryClient.invalidateQueries({ queryKey: ['recentPayouts'] });
   }
 
   // `isSubmittedPending` follows the tx independently of the mutation, which
@@ -378,6 +447,9 @@ function App() {
     amounts !== null &&
     totalAmount > 0n &&
     (!isToken || (validTokenAddress && !needsApproval));
+
+  const unitLabel = isToken ? (tokenSymbol ?? 'tokens') : 'ETH';
+  const dayLabel = `${windowDays} day${windowDays === 1 ? '' : 's'}`;
 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100">
@@ -528,9 +600,55 @@ function App() {
             </div>
           )}
 
+          {/* Duplicate-check settings */}
+          <div className="mt-3 rounded-md border border-gray-800 bg-gray-950/40 p-3">
+            <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
+              <label className="flex items-center gap-2 text-sm text-gray-400">
+                <span>Flag repeats within</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={MAX_WINDOW_DAYS}
+                  value={windowDays}
+                  onChange={(e) => setWindowDays(clampWindowDays(Number(e.target.value)))}
+                  className="w-20 rounded-md bg-gray-800 px-3 py-1.5 text-sm text-gray-100 outline-none focus:ring-2 focus:ring-blue-600"
+                />
+                <span>day{windowDays === 1 ? '' : 's'}</span>
+              </label>
+
+              <label className="flex items-center gap-2 text-sm text-gray-400">
+                <input
+                  type="checkbox"
+                  checked={amountFilterOn}
+                  onChange={(e) => setAmountFilterOn(e.target.checked)}
+                  className="h-4 w-4 accent-blue-600"
+                />
+                <span>only if within</span>
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  value={toleranceInput}
+                  onChange={(e) => setToleranceInput(e.target.value)}
+                  disabled={!amountFilterOn}
+                  className="w-24 rounded-md bg-gray-800 px-3 py-1.5 text-sm text-gray-100 outline-none focus:ring-2 focus:ring-blue-600 disabled:opacity-40"
+                />
+                <span>{unitLabel} of what I'm sending</span>
+              </label>
+            </div>
+
+            {toleranceInvalid && (
+              <p className="mt-2 text-xs text-amber-500/80">
+                {toleranceInput.trim()
+                  ? `"${toleranceInput.trim()}" isn't a valid ${unitLabel} amount`
+                  : 'No threshold entered'}{' '}
+                — every repeat in the window is being shown.
+              </p>
+            )}
+          </div>
+
           {/* Warning: recipients already paid a similar amount recently */}
           {historyLoading && parsed.valid.length > 0 && (
-            <p className="mt-3 text-sm text-gray-500">Checking recent payouts...</p>
+            <p className="mt-3 text-sm text-gray-500">Checking payouts from the last {dayLabel}...</p>
           )}
 
           {historyFailed && parsed.valid.length > 0 && (
@@ -543,19 +661,28 @@ function App() {
             <div className="mt-3 rounded-md bg-amber-900/30 border border-amber-700/50 p-3">
               <p className="text-sm font-medium text-amber-400 mb-2">
                 Warning: {duplicates.length} recipient{duplicates.length !== 1 && 's'} already paid in
-                the last 10 days (across all {checkedWallets.length} of your wallets)
+                the last {dayLabel}
+                {tolerance !== null && ` within ${toleranceInput.trim()} ${unitLabel} of this send`}{' '}
+                (across all {checkedWallets.length} of your wallets)
               </p>
-              <div className="space-y-1">
+              <div className="space-y-2">
                 {duplicates.map((d, i) => (
-                  <div key={i} className="flex items-center justify-between gap-4 text-sm">
-                    <span className="font-mono text-amber-300/70">
+                  <div key={i} className="text-sm">
+                    <div className="font-mono text-amber-300/70">
                       {d.entry.address.slice(0, 10)}...{d.entry.address.slice(-8)} — {d.entry.amount}
-                    </span>
-                    <span className="shrink-0 text-amber-300/50">
-                      paid {formatUnits(d.prior.amount, decimals)} {d.ago} from{' '}
-                      {d.prior.sender.slice(0, 6)}...{d.prior.sender.slice(-4)}
-                      {d.prior.pending && ' (pending)'}
-                    </span>
+                      {d.priors.length > 1 && (
+                        <span className="text-amber-400"> · paid {d.priors.length}× already</span>
+                      )}
+                    </div>
+                    <div className="mt-0.5 space-y-0.5 pl-2">
+                      {d.priors.map((p, j) => (
+                        <div key={j} className="text-amber-300/50">
+                          paid {formatUnits(p.amount, decimals)} {p.ago} from{' '}
+                          {p.sender.slice(0, 6)}...{p.sender.slice(-4)}
+                          {p.pending && ' (pending)'}
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 ))}
               </div>
@@ -575,6 +702,17 @@ function App() {
               </button>
             </div>
           )}
+
+          {/* The amount filter is a narrowing, so what it drops has to be named. */}
+          {hiddenByAmount > 0 && (
+            <p className="mt-3 text-sm text-amber-500/80">
+              {hiddenByAmount} {duplicates.length > 0 && 'other '}recipient
+              {hiddenByAmount !== 1 && 's'}{' '}
+              {hiddenByAmount === 1 ? 'was' : 'were'} paid in the last {dayLabel}, but not within{' '}
+              {toleranceInput.trim()} {unitLabel} of what you're about to send — hidden by the amount
+              filter.
+            </p>
+          )}
         </div>
 
         {/* Summary */}
@@ -593,13 +731,13 @@ function App() {
                     {entry.address.slice(0, 8)}...{entry.address.slice(-6)}
                   </span>
                   <span className="text-gray-100">
-                    {entry.amount} {isToken ? (tokenSymbol ?? 'tokens') : 'ETH'}
+                    {entry.amount} {unitLabel}
                   </span>
                 </div>
               ))}
             </div>
             <div className="mt-3 border-t border-gray-800 pt-3 text-right text-sm font-medium">
-              Total: {formatUnits(totalAmount, decimals)} {isToken ? (tokenSymbol ?? 'tokens') : 'ETH'}
+              Total: {formatUnits(totalAmount, decimals)} {unitLabel}
             </div>
           </div>
         )}
